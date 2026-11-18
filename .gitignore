@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Xcode user settings
+xcuserdata/
+*.xcuserstate
+
+# Local builds and exports
+/build/
+/DerivedData/
+.build/
+*.app/
+*.dSYM/
+*.xcarchive/

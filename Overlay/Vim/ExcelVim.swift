@@ -9,6 +9,11 @@ final class ExcelVim {
         case visual = "Visual"
     }
 
+    enum InsertInput: String, Decodable {
+        case text, tab, backTab, backspace, commit
+        case submit = "return"
+    }
+
     struct Event: Decodable {
         let mode: String?
         let row: Int?
@@ -18,6 +23,9 @@ final class ExcelVim {
         let excelAction: String?
         let arguments: [String]?
         let worksheet: Bool?
+        let recordingRegister: String?
+        let insertInput: InsertInput?
+        let insertText: String?
 
         var excelMode: Mode {
             switch mode?.first {
@@ -40,7 +48,7 @@ final class ExcelVim {
     var onExit: (() -> Void)?
     var isRunning: Bool { process?.isRunning == true }
 
-    func start(commandNames: [String]) throws {
+    func start(commandNames: [String], registerFile: URL? = nil) throws {
         guard !isRunning else { return }
         stop()
         let paths = ["/opt/homebrew/bin/vim", "/usr/local/bin/vim", "/usr/bin/vim"]
@@ -49,6 +57,11 @@ final class ExcelVim {
             throw CocoaError(.fileNoSuchFile)
         }
 
+        if let registerFile {
+            try FileManager.default.createDirectory(at: registerFile.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+        }
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("ExcelVim-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
@@ -86,10 +99,11 @@ final class ExcelVim {
             defer { try? pty.close() }
             let process = Process()
             process.executableURL = URL(fileURLWithPath: vim)
-            process.arguments = ["-N", "-n", "-i", "NONE", "-S", script.path]
+            process.arguments = ["-N", "-n", "-i", registerFile?.path ?? "NONE", "-S", script.path]
             process.environment = ProcessInfo.processInfo.environment.merging([
                 "TERM": "xterm-256color",
                 "EXCEL_VIM_EVENTS": log.path,
+                "EXCEL_VIM_PERSIST_REGISTERS": registerFile == nil ? "0" : "1",
                 "EXCEL_VIM_COMMANDS": commandNames.joined(separator: ",")
             ], uniquingKeysWith: { _, new in new })
             process.standardInput = pty
@@ -146,29 +160,5 @@ final class ExcelVim {
                 onEvent?(event)
             }
         }
-    }
-
-    static func terminalKeys(for key: Int64, characters: String, control: Bool) -> String? {
-        let special: String?
-        switch key {
-        case Int64(kVK_Escape): special = "\u{1b}"
-        case Int64(kVK_Return), Int64(kVK_ANSI_KeypadEnter): special = "\r"
-        case Int64(kVK_Delete): special = "\u{7f}"
-        case Int64(kVK_ForwardDelete): special = "\u{1b}[3~"
-        case Int64(kVK_Tab): special = "\t"
-        case Int64(kVK_LeftArrow): special = "\u{1b}OD"
-        case Int64(kVK_RightArrow): special = "\u{1b}OC"
-        case Int64(kVK_UpArrow): special = "\u{1b}OA"
-        case Int64(kVK_DownArrow): special = "\u{1b}OB"
-        default: special = nil
-        }
-        if let special { return special }
-        if control, let scalar = characters.lowercased().unicodeScalars.first,
-           (97...122).contains(scalar.value), let character = UnicodeScalar(scalar.value - 96) {
-            return String(character)
-        }
-        guard !characters.isEmpty,
-              characters.unicodeScalars.allSatisfy({ $0.value < 0xf700 || $0.value > 0xf8ff }) else { return nil }
-        return characters
     }
 }

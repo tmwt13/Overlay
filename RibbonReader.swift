@@ -12,12 +12,14 @@ final class RibbonReader {
 
     // MARK: - Public
 
-    func readRibbon(_ ribbon: AXUIElement) -> ExcelRibbon? {
-        let tabs = getChildren(ribbon).compactMap { element -> RibbonTab? in
+    func readRibbon(_ ribbon: AXUIElement, includeCommands: Bool = true) -> ExcelRibbon? {
+        let children = getChildren(ribbon)
+        let tabs = children.compactMap { element -> RibbonTab? in
             let role = getString(element, kAXRoleAttribute)
 
-            guard role == "AXRadioButton",
+            guard role == kAXRadioButtonRole || role == "AXTab",
                   let title = getString(element, kAXTitleAttribute)
+                    ?? getString(element, kAXDescriptionAttribute)
             else {
                 return nil
             }
@@ -30,115 +32,46 @@ final class RibbonReader {
             )
         }
 
-        let visibleGroups = readVisibleGroups(in: ribbon)
-
-        // Die sichtbaren Gruppen gehören zum aktuell geöffneten Tab.
-        let activeTitle = tabs.first(where: {
-            isSelected($0.element)
-        })?.title
-
-        let updatedTabs = tabs.map { tab in
-            RibbonTab(
-                id: tab.id,
-                title: tab.title,
-                element: tab.element,
-                groups: tab.title == activeTitle ? visibleGroups : []
-            )
+        guard includeCommands, let active = tabs.firstIndex(where: { isSelected($0.element) }) else {
+            return ExcelRibbon(tabs: tabs)
         }
-
+        var updatedTabs = tabs
+        updatedTabs[active].groups = readVisibleGroups(in: children)
         return ExcelRibbon(tabs: updatedTabs)
     }
     
     
-    private func inspectAttributes(of element: AXUIElement) {
-        var rawNames: CFArray?
-
-        let error = AXUIElementCopyAttributeNames(
-            element,
-            &rawNames
-        )
-
-        guard error == .success,
-              let names = rawNames as? [String] else {
-            return
-        }
-
-        print("    Attributes:")
-
-        for name in names {
-            guard let value = getAttribute(element, name) else {
-                continue
-            }
-
-            print("      \(name): \(value)")
-        }
-    }
-
     // MARK: - Groups
 
     
-    private func readVisibleGroups(
-        in ribbon: AXUIElement
-    ) -> [RibbonGroup] {
+    private func readVisibleGroups(in children: [AXUIElement]) -> [RibbonGroup] {
+        guard let scrollArea = children.first(where: {
+            getString($0, kAXRoleAttribute) == kAXScrollAreaRole
+        }), let viewport = getFrame(scrollArea), !viewport.isEmpty else { return [] }
 
-        guard let scrollArea = getChildren(ribbon).first(where: {
-            getString($0, kAXRoleAttribute) == "AXScrollArea"
-        }) else {
-            print("Ribbon scroll area not found")
-            return []
-        }
-
-        let groups = getChildren(scrollArea)
-            .filter {
-                getString($0, kAXRoleAttribute) == "AXGroup"
-            }
-
-        return groups.enumerated().compactMap { index, group in
-
-            inspectAttributes(of: group)
-
-            guard let frame = getFrame(group) else {
-                print("Could not get frame for group \(index)")
-                return nil
-            }
-
+        return getChildren(scrollArea).enumerated().compactMap { index, group in
+            var commands: [RibbonCommand] = []
+            collectCommands(from: group, in: viewport, into: &commands)
+            guard !commands.isEmpty else { return nil }
             let title = getString(group, kAXTitleAttribute)
                 ?? getString(group, kAXDescriptionAttribute)
-
             return RibbonGroup(
                 id: "\(index)-\(title ?? "group")",
                 title: title,
-                frame: frame,
-                commands: readCommands(in: group)
+                frame: getFrame(group) ?? viewport,
+                commands: commands
             )
         }
     }
 
-
     // MARK: - Commands
 
-    private func readCommands(
-        in group: AXUIElement
-    ) -> [RibbonCommand] {
-
-        var commands: [RibbonCommand] = []
-
-        collectCommands(
-            from: group,
-            into: &commands
-        )
-
-        return commands
-    }
-
-    
     private func collectCommands(
         from element: AXUIElement,
+        in viewport: CGRect,
         into commands: inout [RibbonCommand]
     ) {
-
         let role = getString(element, kAXRoleAttribute) ?? ""
-
         var rawActions: CFArray?
         AXUIElementCopyActionNames(element, &rawActions)
 
@@ -147,9 +80,10 @@ final class RibbonReader {
         let title = getString(element, kAXTitleAttribute)
             ?? getString(element, kAXDescriptionAttribute)
 
-        if let title,
-           !actions.isEmpty,
-           let frame = getFrame(element) {
+        if let title, !actions.isEmpty,
+           (getAttribute(element, kAXEnabledAttribute) as? NSNumber)?.boolValue != false,
+           let frame = getFrame(element),
+           viewport.contains(CGPoint(x: frame.midX, y: frame.midY)) {
 
             let identifier = getString(
                 element,
@@ -170,7 +104,7 @@ final class RibbonReader {
         }
 
         for child in getChildren(element) {
-            collectCommands(from: child, into: &commands)
+            collectCommands(from: child, in: viewport, into: &commands)
         }
     }
 
@@ -219,38 +153,25 @@ final class RibbonReader {
         return value
     }
 
-    private func isSelected(_ element: AXUIElement) -> Bool {
-        guard let value = getAttribute(
-            element,
-            kAXValueAttribute
-        ) else {
-            return false
-        }
-
-        return (value as? NSNumber)?.boolValue ?? false
+    func isSelected(_ element: AXUIElement) -> Bool {
+        let selected = getAttribute(element, kAXSelectedAttribute) as? NSNumber
+        let value = getAttribute(element, kAXValueAttribute) as? NSNumber
+        return selected?.boolValue == true || value?.boolValue == true
     }
     
-    private func getFrame(_ element: AXUIElement) -> CGRect? {
-        guard let value = getAttribute(
-            element,
-            kAXFrameAttribute as String
-        ),
-        CFGetTypeID(value) == AXValueGetTypeID() else {
-            return nil
-        }
+    func getFrame(_ element: AXUIElement) -> CGRect? {
+        guard let position = getAttribute(element, kAXPositionAttribute),
+              let size = getAttribute(element, kAXSizeAttribute),
+              CFGetTypeID(position) == AXValueGetTypeID(),
+              CFGetTypeID(size) == AXValueGetTypeID() else { return nil }
 
-        var frame = CGRect.zero
+        var origin = CGPoint.zero
+        var dimensions = CGSize.zero
+        guard AXValueGetValue(position as! AXValue, .cgPoint, &origin),
+              AXValueGetValue(size as! AXValue, .cgSize, &dimensions),
+              origin.x.isFinite, origin.y.isFinite,
+              dimensions.width.isFinite, dimensions.height.isFinite else { return nil }
 
-        guard AXValueGetValue(
-            value as! AXValue,
-            .cgRect,
-            &frame
-        ) else {
-            return nil
-        }
-
-        return frame
-    }
+        return CGRect(origin: origin, size: dimensions)
     }
 }
-

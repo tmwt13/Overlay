@@ -205,6 +205,87 @@ final class AccessibilityManager {
             as? [AXUIElement] ?? []
     }
     
+    enum EditCommit {
+        case inactive
+        case committed
+        case useReturn
+    }
+
+    func commitExcelEdit(in process: pid_t) -> EditCommit {
+        let app = AXUIElementCreateApplication(process)
+        AXUIElementSetMessagingTimeout(app, 0.05)
+        guard let value = getAttribute(app, kAXFocusedWindowAttribute),
+              CFGetTypeID(value) == AXUIElementGetTypeID() else { return .inactive }
+        let window = value as! AXUIElement
+        guard let accept = getChildren(window).first(where: {
+            getAttribute($0, kAXIdentifierAttribute) as? String == "EnterButton"
+        }) else { return .inactive }
+        guard (getAttribute(accept, kAXEnabledAttribute) as? NSNumber)?.boolValue == true else {
+            if let focused = getAttribute(app, kAXFocusedUIElementAttribute),
+               CFGetTypeID(focused) == AXUIElementGetTypeID(),
+               getAttribute(focused as! AXUIElement, kAXIdentifierAttribute) as? String == "XLFormulaEditor" {
+                return .useReturn
+            }
+            return .inactive
+        }
+        return AXUIElementPerformAction(accept, kAXPressAction as CFString) == .success
+            ? .committed : .useReturn
+    }
+
+    func isExcelGridFocused(in process: pid_t) -> Bool {
+        let app = AXUIElementCreateApplication(process)
+        AXUIElementSetMessagingTimeout(app, 0.05)
+        guard let focused = getAttribute(app, kAXFocusedUIElementAttribute),
+              CFGetTypeID(focused) == AXUIElementGetTypeID() else { return false }
+        let element = focused as! AXUIElement
+        return getAttribute(element, kAXRoleAttribute) as? String == kAXLayoutAreaRole
+    }
+
+    func clearExcelFormats(in process: pid_t) -> Bool {
+        let app = AXUIElementCreateApplication(process)
+        AXUIElementSetMessagingTimeout(app, 0.2)
+        guard let value = getAttribute(app, kAXMenuBarAttribute),
+              CFGetTypeID(value) == AXUIElementGetTypeID() else { return false }
+
+        let menuBar = value as! AXUIElement
+        guard let edit = getChildren(menuBar).first(where: {
+            getAttribute($0, kAXIdentifierAttribute) as? String == "EditMenu_MenuItem"
+                || hasMenuTitle($0, names: ["Edit", "Bearbeiten"])
+        }), let clear = menuItem(in: edit, named: ["Clear", "Löschen", "Inhalte löschen"]),
+        let formats = menuItem(in: clear, named: ["Formats", "Clear Formats", "Formate", "Formate löschen"]),
+        (getAttribute(formats, kAXEnabledAttribute) as? NSNumber)?.boolValue == true else { return false }
+
+        return AXUIElementPerformAction(formats, kAXPressAction as CFString) == .success
+    }
+
+    private func menuItem(in parent: AXUIElement, named names: [String]) -> AXUIElement? {
+        // macOS represents submenu entries as children of an AXMenu wrapper.
+        for child in getChildren(parent) {
+            switch getAttribute(child, kAXRoleAttribute) as? String {
+            case kAXMenuItemRole where hasMenuTitle(child, names: names):
+                return child
+            case kAXMenuRole:
+                if let item = menuItem(in: child, named: names) { return item }
+            default:
+                break
+            }
+        }
+        return nil
+    }
+
+    private func hasMenuTitle(_ element: AXUIElement, names: [String]) -> Bool {
+        guard let title = getAttribute(element, kAXTitleAttribute) as? String else { return false }
+        return names.contains { title.caseInsensitiveCompare($0) == .orderedSame }
+    }
+
+    func focusedRibbon(in process: pid_t) -> AXUIElement? {
+        let app = AXUIElementCreateApplication(process)
+        AXUIElementSetMessagingTimeout(app, 0.2)
+        guard let value = getAttribute(app, kAXFocusedWindowAttribute),
+              CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return findRibbon(in: value as! AXUIElement)
+    }
+
     private func findRibbon(in window: AXUIElement) -> AXUIElement? {
         for child in getChildren(window) {
             let role = getAttribute(
@@ -248,7 +329,7 @@ final class AccessibilityManager {
         // Read complete Ribbon model
         let reader = RibbonReader()
 
-        guard let ribbonModel = reader.readRibbon(in: window) else {
+        guard let ribbonModel = reader.readRibbon(ribbonElement) else {
             return
         }
 
@@ -436,7 +517,8 @@ final class AccessibilityManager {
 
         let reader = RibbonReader()
 
-        guard let ribbon = reader.readRibbon(in: window) else {
+        guard let ribbonElement = findRibbon(in: window),
+              let ribbon = reader.readRibbon(ribbonElement) else {
             return
         }
 
